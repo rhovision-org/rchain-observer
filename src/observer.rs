@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures::future::join_all;
@@ -9,11 +9,13 @@ use serde::Deserialize;
 
 use crate::{
     ancestry::verify_ancestry,
+    config::{validate_targets, MAX_ANCESTRY_BLOCKS},
+    http::{get_json, SNAPSHOT_BODY_LIMIT},
     model::{
         AncestryCheck, AncestryClass, FinalizedIdentity, HeightSummary, NodeTarget, Observation,
         ObservationReport, VerdictClass,
     },
-    verdict::{classify, refine_with_ancestry},
+    verdict::{classify, finalized_identity, refine_with_ancestry},
 };
 
 const DEFAULT_ANCESTRY_MAX_BLOCKS: usize = 512;
@@ -54,7 +56,15 @@ pub struct Observer {
 
 impl Observer {
     pub fn new(nodes: Vec<NodeTarget>, timeout: Duration) -> anyhow::Result<Self> {
-        let client = Client::builder().timeout(timeout).build()?;
+        anyhow::ensure!(
+            !timeout.is_zero() && timeout <= Duration::from_secs(30),
+            "timeout must be between 1 and 30000 ms"
+        );
+        let nodes = validate_targets(nodes).map_err(anyhow::Error::msg)?;
+        let client = Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         Ok(Self {
             client,
             nodes,
@@ -64,11 +74,13 @@ impl Observer {
     }
 
     pub fn with_ancestry_max_blocks(mut self, max_blocks: usize) -> Self {
-        self.ancestry_max_blocks = max_blocks;
+        self.ancestry_max_blocks = max_blocks.min(MAX_ANCESTRY_BLOCKS);
         self
     }
 
     pub async fn observe(&self) -> ObservationReport {
+        let started = Instant::now();
+        let observed_at_ms = unix_ms();
         let observations = join_all(
             self.nodes
                 .iter()
@@ -87,14 +99,11 @@ impl Observer {
         verdict = refine_with_ancestry(verdict, &ancestry_checks);
 
         let heights = summarize_heights(&observations);
-        let observed_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-
         ObservationReport {
+            schema_version: 1,
             observed_at_ms,
+            completed_at_ms: unix_ms(),
+            duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             heights,
             observations,
             ancestry_checks,
@@ -138,6 +147,8 @@ impl Observer {
         });
 
         let mut checks = Vec::with_capacity(lower_identities.len());
+        // All pairs and witness fallbacks share one wall-time budget.
+        let deadline = tokio::time::Instant::now() + self.ancestry_timeout;
         for lower in lower_identities {
             if witnesses.is_empty() {
                 checks.push(AncestryCheck {
@@ -155,8 +166,8 @@ impl Observer {
 
             let mut fallback = None;
             for witness in &witnesses {
-                let check = match tokio::time::timeout(
-                    self.ancestry_timeout,
+                let check = match tokio::time::timeout_at(
+                    deadline,
                     verify_ancestry(
                         &self.client,
                         witness,
@@ -201,32 +212,24 @@ async fn observe_node(client: Client, node: NodeTarget) -> Observation {
     let status_url = format!("{base}/api/status");
     let finalized_url = format!("{base}/api/last-finalized-block");
 
-    let (status_result, finalized_result) = tokio::join!(
-        client.get(status_url).send(),
-        client.get(finalized_url).send()
+    let (status, finalized) = tokio::join!(
+        get_json::<StatusResponse>(&client, &status_url, SNAPSHOT_BODY_LIMIT),
+        get_json::<FinalizedResponse>(&client, &finalized_url, SNAPSHOT_BODY_LIMIT)
     );
-
-    let status = match status_result {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => response.json::<StatusResponse>().await,
-            Err(error) => return failed(&node, error.to_string()),
-        },
-        Err(error) => return failed(&node, error.to_string()),
-    };
-
-    let finalized = match finalized_result {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => response.json::<FinalizedResponse>().await,
-            Err(error) => return failed(&node, error.to_string()),
-        },
-        Err(error) => return failed(&node, error.to_string()),
-    };
 
     match (status, finalized) {
         (Ok(status), Ok(finalized)) => {
             let block = finalized.block_info;
             let finalized_shard = block.as_ref().and_then(|value| value.shard_id.clone());
-            Observation {
+            if let (Some(status_shard), Some(block_shard)) = (&status.shard_id, &finalized_shard) {
+                if status_shard != block_shard {
+                    return failed(
+                        &node,
+                        "status and finalized block report different shards".to_string(),
+                    );
+                }
+            }
+            let mut observation = Observation {
                 node: node.name,
                 base_url: node.base_url,
                 reachable: true,
@@ -236,23 +239,23 @@ async fn observe_node(client: Client, node: NodeTarget) -> Observation {
                 finalized_block: block.as_ref().and_then(|value| value.block_number),
                 finalized_hash: block.and_then(|value| value.block_hash),
                 error: None,
+            };
+            if finalized_identity(&observation).is_none() {
+                observation.error = Some(
+                    "node omitted or malformed a required finalized identity field".to_string(),
+                );
+            } else {
+                observation.finalized_hash = observation
+                    .finalized_hash
+                    .map(|hash| hash.to_ascii_lowercase());
             }
+            observation
         }
         (Err(error), _) | (_, Err(error)) => failed(&node, error.to_string()),
     }
 }
 
-fn finalized_identity(observation: &Observation) -> Option<FinalizedIdentity> {
-    Some(FinalizedIdentity {
-        network_id: observation.network_id.clone()?,
-        shard_id: observation.shard_id.clone()?,
-        block_number: observation.finalized_block?,
-        block_hash: observation.finalized_hash.clone()?,
-    })
-}
-
 fn failed(node: &NodeTarget, error: String) -> Observation {
-    let error = error.replace(&node.base_url, "<node>");
     Observation {
         node: node.name.clone(),
         base_url: node.base_url.clone(),
@@ -267,9 +270,13 @@ fn failed(node: &NodeTarget, error: String) -> Observation {
 }
 
 fn summarize_heights(observations: &[Observation]) -> HeightSummary {
-    let latest = observations.iter().filter_map(|value| value.latest_block);
+    let latest = observations
+        .iter()
+        .filter(|value| value.reachable)
+        .filter_map(|value| value.latest_block);
     let finalized = observations
         .iter()
+        .filter(|value| value.reachable)
         .filter_map(|value| value.finalized_block);
     let latest_min = latest.clone().min();
     let latest_max = latest.max();
@@ -283,4 +290,12 @@ fn summarize_heights(observations: &[Observation]) -> HeightSummary {
         finalized_min,
         finalized_max,
     }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }

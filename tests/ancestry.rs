@@ -256,7 +256,7 @@ async fn missing_raw_block_evidence_keeps_height_skew_unresolved() {
     let check = &report.ancestry_checks[0];
     assert_eq!(check.class, AncestryClass::UnresolvedHeightSkew);
     assert_eq!(check.cryptographically_verified_blocks, 1);
-    assert!(check.reason.contains("503 Service Unavailable"));
+    assert!(check.reason.contains("HTTP 503"));
 }
 
 #[tokio::test]
@@ -329,4 +329,62 @@ async fn outer_sender_must_match_sender_committed_by_verified_preimage() {
 
     assert_eq!(report.verdict.class, VerdictClass::HeightSkew);
     assert!(report.ancestry_checks[0].reason.contains("sender differs"));
+}
+
+#[tokio::test]
+async fn a_wide_frontier_cannot_allocate_beyond_the_unique_block_budget() {
+    let lower = raw_fixture(99, &[]);
+    let parents = (0..40u8)
+        .map(|byte| hex::encode([byte; 32]))
+        .collect::<Vec<_>>();
+    let higher = raw_fixture(100, &parents);
+    let report = observe_pair(
+        &lower,
+        &higher,
+        HashMap::from([(higher.hash.clone(), higher.response.clone())]),
+        None,
+    )
+    .await;
+    assert_eq!(report.verdict.class, VerdictClass::HeightSkew);
+    assert_eq!(report.ancestry_checks[0].examined_blocks, 1);
+    assert!(report.ancestry_checks[0].reason.contains("frontier"));
+}
+
+#[tokio::test]
+async fn duplicate_justifications_are_fetched_once_and_the_path_is_preserved() {
+    let lower = raw_fixture(99, &[]);
+    let higher = raw_fixture(100, &[lower.hash.clone(), lower.hash.clone()]);
+    let report = observe_pair(
+        &lower,
+        &higher,
+        HashMap::from([
+            (higher.hash.clone(), higher.response.clone()),
+            (lower.hash.clone(), lower.response.clone()),
+        ]),
+        None,
+    )
+    .await;
+    assert_eq!(report.verdict.class, VerdictClass::ProvenLag);
+    assert_eq!(report.ancestry_checks[0].examined_blocks, 2);
+    assert_eq!(
+        report.ancestry_checks[0].path,
+        vec![higher.hash, lower.hash]
+    );
+}
+
+#[tokio::test]
+async fn an_excessive_justification_fanout_is_unresolved() {
+    let lower = raw_fixture(99, &[]);
+    let higher = raw_fixture(100, &vec![lower.hash.clone(); 1025]);
+    let report = observe_pair(
+        &lower,
+        &higher,
+        HashMap::from([(higher.hash.clone(), higher.response.clone())]),
+        None,
+    )
+    .await;
+    assert_eq!(report.verdict.class, VerdictClass::HeightSkew);
+    assert!(report.ancestry_checks[0]
+        .reason
+        .contains("1024-justification"));
 }

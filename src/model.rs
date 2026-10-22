@@ -81,7 +81,11 @@ pub struct HeightSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservationReport {
+    pub schema_version: u32,
+    /// Oldest possible sample time; requests within one cycle are not atomic.
     pub observed_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub duration_ms: u64,
     pub heights: HeightSummary,
     pub observations: Vec<Observation>,
     pub ancestry_checks: Vec<AncestryCheck>,

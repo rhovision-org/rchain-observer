@@ -6,6 +6,7 @@ use prost::Message;
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::http::{get_json, RAW_BODY_LIMIT};
 use crate::model::NodeTarget;
 
 #[derive(Debug, Deserialize)]
@@ -65,20 +66,10 @@ pub async fn fetch_verified_block(
     witness: &NodeTarget,
     requested_hash: &str,
 ) -> Result<VerifiedBlockEvidence, String> {
+    decode_hash("requested block hash", requested_hash)?;
     let base = witness.base_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/block/{requested_hash}/raw");
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| sanitize_error(witness, error.to_string()))?;
-    let response = response
-        .error_for_status()
-        .map_err(|error| sanitize_error(witness, error.to_string()))?;
-    let raw = response
-        .json::<RawBlockResponse>()
-        .await
-        .map_err(|error| sanitize_error(witness, error.to_string()))?;
+    let raw = get_json::<RawBlockResponse>(client, &url, RAW_BODY_LIMIT).await?;
     verify_raw_block(requested_hash, raw)
 }
 
@@ -152,6 +143,9 @@ fn verify_raw_block(
     }
 
     let mut justifications = Vec::with_capacity(decoded.justifications.len());
+    if decoded.justifications.len() > 1024 {
+        return Err("verified raw block exceeds the 1024-justification evidence limit".to_string());
+    }
     for justification in decoded.justifications {
         if justification.len() != 32 {
             return Err(format!(
@@ -190,11 +184,7 @@ fn verify_detached_signature(
         "secp256k1:eth" => Signature::from_slice(signature).map_err(|_| {
             "raw block signature is not a valid 64-byte secp256k1:eth signature".to_string()
         })?,
-        _ => {
-            return Err(format!(
-                "raw block uses unsupported signature algorithm: {algorithm}"
-            ))
-        }
+        _ => return Err("raw block uses an unsupported signature algorithm".to_string()),
     };
 
     verifying_key
@@ -208,8 +198,4 @@ fn decode_hash(label: &str, value: &str) -> Result<Vec<u8>, String> {
         return Err(format!("{label} must be exactly 32 bytes"));
     }
     Ok(bytes)
-}
-
-fn sanitize_error(witness: &NodeTarget, error: String) -> String {
-    error.replace(&witness.base_url, "<node>")
 }
