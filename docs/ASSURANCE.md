@@ -15,6 +15,7 @@ This document describes implementation checks, not formal verification or an ind
 | Redirects/private upstream error bodies are not published | `redirect_and_private_error_bodies_are_not_followed_or_published` |
 | Reachability, readiness and freshness remain distinct | `health_readiness_freshness_and_http_boundary_are_distinct` |
 | Observer HTTP paths cannot proxy writes | POST rejection and unknown node-route tests |
+| Reverse proxy preserves a browser-usable, read-only HTTP contract | `scripts/test-nginx-proxy.py`: real Nginx, single CORS/cache/nosniff headers, GET/HEAD, readiness 503, blocked writes |
 | Raw content and proposer signatures are verified | Existing tamper, sender mismatch, invalid-signature and both-algorithm fixtures in `tests/ancestry.rs` |
 | Ancestry absence or missing evidence does not become assumed lag | Existing conflict/missing-evidence fixtures |
 | Frontier allocation is bounded before fetch | Wide-frontier test |

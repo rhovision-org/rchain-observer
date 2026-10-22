@@ -162,6 +162,10 @@ Polling never overlaps itself; missed interval ticks are skipped. SIGINT/SIGTERM
 
 Deploy a reviewed release artifact, retain the previous binary, restart only the observer, and verify `/health`, `/ready` and a complete observation report. A 503 readiness result is evidence to investigate; do not replace it with an unconditional success response. The supplied systemd example uses four endpoints as an operator configuration, not a hard-coded requirement.
 
+Verify the public HTTPS path from the consuming browser as well as loopback health. The service emits CORS and cache headers itself. A proxy that also adds them must hide the upstream copies first: browsers reject multiple `Access-Control-Allow-Origin` values, even when both are `*`. The supplied Nginx example keeps one edge-owned copy of CORS, cache and content-type protection headers, including on error responses, and preserves upstream readiness status codes.
+
+With Nginx and Python 3 installed, `python3 scripts/test-nginx-proxy.py` exercises that exact proxy example against an isolated mock upstream. It checks single response headers, GET/HEAD behavior, propagation of readiness failures, and blocked writes. It uses temporary configuration and ephemeral loopback ports; it does not reload the system Nginx service or contact a validator. CI runs this contract separately from Rust tests.
+
 ## Reproducible verification
 
 ```bash

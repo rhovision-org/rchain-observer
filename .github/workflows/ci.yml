@@ -12,6 +12,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y nginx-light
+      - run: python3 scripts/test-nginx-proxy.py
+
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 20
