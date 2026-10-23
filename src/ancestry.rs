@@ -1,8 +1,9 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use reqwest::Client;
 
 use crate::{
+    config::MAX_ANCESTRY_BLOCKS,
     model::{AncestryCheck, AncestryClass, FinalizedIdentity, NodeTarget},
     raw_block::fetch_verified_block,
 };
@@ -10,8 +11,6 @@ use crate::{
 #[derive(Debug)]
 struct QueueEntry {
     hash: String,
-    path: Vec<String>,
-    parent_height: Option<u64>,
 }
 
 pub async fn verify_ancestry(
@@ -21,6 +20,7 @@ pub async fn verify_ancestry(
     higher: &FinalizedIdentity,
     max_blocks: usize,
 ) -> AncestryCheck {
+    let max_blocks = max_blocks.min(MAX_ANCESTRY_BLOCKS);
     if lower.network_id != higher.network_id || lower.shard_id != higher.shard_id {
         return unresolved(
             witness,
@@ -47,17 +47,14 @@ pub async fn verify_ancestry(
 
     let mut queue = VecDeque::from([QueueEntry {
         hash: higher.block_hash.clone(),
-        path: vec![higher.block_hash.clone()],
-        parent_height: None,
     }]);
-    let mut seen = HashSet::new();
+    // One predecessor per unique hash bounds storage linearly in the block budget.
+    let mut predecessors = HashMap::from([(higher.block_hash.clone(), None::<String>)]);
+    let mut upper_bounds: HashMap<String, u64> = HashMap::new();
+    let mut verified_heights: HashMap<String, u64> = HashMap::new();
     let mut examined_blocks = 0usize;
 
     while let Some(entry) = queue.pop_front() {
-        if !seen.insert(entry.hash.clone()) {
-            continue;
-        }
-
         if examined_blocks >= max_blocks {
             return unresolved(
                 witness,
@@ -94,7 +91,7 @@ pub async fn verify_ancestry(
             );
         }
 
-        if entry.parent_height.is_none() && block.block_number != higher.block_number {
+        if entry.hash == higher.block_hash && block.block_number != higher.block_number {
             return unresolved(
                 witness,
                 lower,
@@ -104,8 +101,8 @@ pub async fn verify_ancestry(
             );
         }
 
-        if let Some(parent_height) = entry.parent_height {
-            if block.block_number >= parent_height {
+        if let Some(parent_height) = upper_bounds.get(&entry.hash) {
+            if block.block_number >= *parent_height {
                 return unresolved(
                     witness,
                     lower,
@@ -115,6 +112,7 @@ pub async fn verify_ancestry(
                 );
             }
         }
+        verified_heights.insert(entry.hash.clone(), block.block_number);
 
         if block.block_hash == lower.block_hash {
             if block.block_number != lower.block_number {
@@ -126,6 +124,13 @@ pub async fn verify_ancestry(
                     "target block hash was returned with an unexpected height",
                 );
             }
+            let mut path = vec![entry.hash.clone()];
+            let mut cursor = entry.hash.as_str();
+            while let Some(Some(parent)) = predecessors.get(cursor) {
+                path.push(parent.clone());
+                cursor = parent;
+            }
+            path.reverse();
             return AncestryCheck {
                 class: AncestryClass::ProvenLag,
                 lower: lower.clone(),
@@ -133,7 +138,7 @@ pub async fn verify_ancestry(
                 witness_node: Some(witness.name.clone()),
                 examined_blocks,
                 cryptographically_verified_blocks: examined_blocks,
-                path: entry.path,
+                path,
                 reason: "lower finalized block is reachable through a justification DAG decoded only from BLAKE2b-256-verified raw block preimages".to_string(),
             };
         }
@@ -147,12 +152,37 @@ pub async fn verify_ancestry(
         }
 
         for justification in block.justifications {
-            let mut path = entry.path.clone();
-            path.push(justification.clone());
+            if verified_heights
+                .get(&justification)
+                .is_some_and(|height| *height >= block.block_number)
+            {
+                return unresolved(
+                    witness,
+                    lower,
+                    higher,
+                    examined_blocks,
+                    "justification edge did not descend in block height",
+                );
+            }
+            upper_bounds
+                .entry(justification.clone())
+                .and_modify(|bound| *bound = (*bound).min(block.block_number))
+                .or_insert(block.block_number);
+            if predecessors.contains_key(&justification) {
+                continue;
+            }
+            if predecessors.len() >= max_blocks {
+                return unresolved(
+                    witness,
+                    lower,
+                    higher,
+                    examined_blocks,
+                    "ancestry frontier exceeded the unique-block evidence budget",
+                );
+            }
+            predecessors.insert(justification.clone(), Some(entry.hash.clone()));
             queue.push_back(QueueEntry {
                 hash: justification,
-                path,
-                parent_height: Some(block.block_number),
             });
         }
     }

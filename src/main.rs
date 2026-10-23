@@ -1,10 +1,18 @@
-use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Context};
-use axum::{extract::State, routing::get, Json, Router};
 use clap::{Parser, Subcommand};
-use rchain_observer::{model::NodeTarget, observer::Observer};
-use serde_json::{json, Value};
+use rchain_observer::{
+    config::{parse_node, MAX_ANCESTRY_BLOCKS},
+    model::NodeTarget,
+    observer::Observer,
+    service::{self, ApiState, CachedReport},
+};
 use tokio::{
     net::TcpListener,
     sync::RwLock,
@@ -36,35 +44,16 @@ enum Command {
         listen: String,
         #[arg(long, default_value_t = 5000)]
         refresh_ms: u64,
+        #[arg(long, default_value_t = 30000)]
+        stale_after_ms: u64,
     },
-}
-
-#[derive(Clone)]
-struct ApiState {
-    snapshot: Arc<RwLock<rchain_observer::model::ObservationReport>>,
-}
-
-fn parse_node(value: &str) -> Result<NodeTarget, String> {
-    let (name, base_url) = value
-        .split_once('=')
-        .ok_or_else(|| "node must be NAME=URL".to_string())?;
-    if name.trim().is_empty() || base_url.trim().is_empty() {
-        return Err("node must be NAME=URL".to_string());
-    }
-    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-        return Err("node URL must start with http:// or https://".to_string());
-    }
-    Ok(NodeTarget {
-        name: name.to_string(),
-        base_url: base_url.to_string(),
-    })
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if cli.ancestry_max_blocks == 0 {
-        return Err(anyhow!("ancestry-max-blocks must be at least 1"));
+    if cli.ancestry_max_blocks == 0 || cli.ancestry_max_blocks > MAX_ANCESTRY_BLOCKS {
+        return Err(anyhow!("ancestry-max-blocks must be between 1 and 4096"));
     }
     let observer = Observer::new(cli.nodes, Duration::from_millis(cli.timeout_ms))?
         .with_ancestry_max_blocks(cli.ancestry_max_blocks);
@@ -74,62 +63,79 @@ async fn main() -> anyhow::Result<()> {
             let report = observer.observe().await;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::Serve { listen, refresh_ms } => serve(observer, &listen, refresh_ms).await?,
+        Command::Serve {
+            listen,
+            refresh_ms,
+            stale_after_ms,
+        } => serve(observer, &listen, refresh_ms, stale_after_ms).await?,
     }
 
     Ok(())
 }
 
-async fn serve(observer: Observer, listen: &str, refresh_ms: u64) -> anyhow::Result<()> {
+async fn serve(
+    observer: Observer,
+    listen: &str,
+    refresh_ms: u64,
+    stale_after_ms: u64,
+) -> anyhow::Result<()> {
     if refresh_ms < 1000 {
         return Err(anyhow!("refresh-ms must be at least 1000"));
     }
 
+    if stale_after_ms < 1000 {
+        return Err(anyhow!("stale-after-ms must be at least 1000"));
+    }
+
     let address = SocketAddr::from_str(listen)
         .with_context(|| format!("invalid listen address: {listen}"))?;
+    let sampled = Instant::now();
     let initial = observer.observe().await;
     let state = ApiState {
-        snapshot: Arc::new(RwLock::new(initial)),
+        snapshot: Arc::new(RwLock::new(CachedReport {
+            report: initial,
+            sampled,
+        })),
+        stale_after: Duration::from_millis(stale_after_ms),
     };
 
     let refresh_state = state.clone();
     let refresh_observer = observer.clone();
-    tokio::spawn(async move {
+    let refresh_task = tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_millis(refresh_ms));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
             interval.tick().await;
-            let next = refresh_observer.observe().await;
-            *refresh_state.snapshot.write().await = next;
+            let sampled = Instant::now();
+            let report = refresh_observer.observe().await;
+            *refresh_state.snapshot.write().await = CachedReport { report, sampled };
         }
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/observation", get(observation))
-        .with_state(state);
+    let app = service::router(state);
     let listener = TcpListener::bind(address).await?;
-    axum::serve(listener, app)
-        .await
-        .map_err(|error| anyhow!(error))?;
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown())
+        .await;
+    refresh_task.abort();
+    result.map_err(|error| anyhow!(error))?;
     Ok(())
 }
 
-async fn health(State(state): State<ApiState>) -> Json<Value> {
-    let snapshot = state.snapshot.read().await;
-    Json(json!({
-        "status": "ok",
-        "observedAtMs": snapshot.observed_at_ms,
-        "observedNodes": snapshot.verdict.observed_nodes,
-        "reachableNodes": snapshot.heights.reachable_nodes,
-        "verdict": snapshot.verdict.class,
-        "ancestryChecks": snapshot.ancestry_checks.len(),
-    }))
-}
-
-async fn observation(
-    State(state): State<ApiState>,
-) -> Json<rchain_observer::model::ObservationReport> {
-    Json(state.snapshot.read().await.clone())
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

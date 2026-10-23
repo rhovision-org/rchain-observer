@@ -12,7 +12,7 @@ fn observed(node: &str, block: u64, hash: &str) -> Observation {
         shard_id: Some("/root".to_string()),
         latest_block: Some(block + 2),
         finalized_block: Some(block),
-        finalized_hash: Some(hash.to_string()),
+        finalized_hash: Some(format!("{hash:0<64}")),
         error: None,
     }
 }

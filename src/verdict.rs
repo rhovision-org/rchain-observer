@@ -5,8 +5,13 @@ use crate::model::{
 };
 
 pub fn classify(observations: &[Observation]) -> Verdict {
+    let mut node_counts = HashMap::new();
+    for observation in observations {
+        *node_counts.entry(&observation.node).or_insert(0usize) += 1;
+    }
     let identities = observations
         .iter()
+        .filter(|observation| node_counts[&observation.node] == 1)
         .filter_map(finalized_identity)
         .collect::<Vec<_>>();
 
@@ -86,7 +91,19 @@ pub fn classify(observations: &[Observation]) -> Verdict {
         };
     }
 
-    let (class, summary) = if agreeing_nodes * 2 > comparable_nodes {
+    // Height chooses the ancestry anchor; support chooses the majority in a conflict.
+    let (reference, agreeing_nodes) = exact_groups
+        .iter()
+        .max_by(|(left, lc), (right, rc)| {
+            lc.cmp(rc)
+                .then_with(|| left.block_number.cmp(&right.block_number))
+                .then_with(|| left.block_hash.cmp(&right.block_hash))
+                .then_with(|| left.network_id.cmp(&right.network_id))
+                .then_with(|| left.shard_id.cmp(&right.shard_id))
+        })
+        .map(|(id, count)| (id.clone(), *count))
+        .expect("non-empty finalized groups");
+    let (class, summary) = if agreeing_nodes > comparable_nodes / 2 {
         (
             VerdictClass::Majority,
             format!(
@@ -112,12 +129,25 @@ pub fn classify(observations: &[Observation]) -> Verdict {
     }
 }
 
-fn finalized_identity(observation: &Observation) -> Option<FinalizedIdentity> {
+pub fn finalized_identity(observation: &Observation) -> Option<FinalizedIdentity> {
+    if !observation.reachable || observation.error.is_some() {
+        return None;
+    }
+    let network_id = observation.network_id.as_ref()?;
+    let shard_id = observation.shard_id.as_ref()?;
+    let hash = observation.finalized_hash.as_ref()?;
+    if network_id.trim().is_empty()
+        || shard_id.trim().is_empty()
+        || hash.len() != 64
+        || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
     Some(FinalizedIdentity {
-        network_id: observation.network_id.clone()?,
-        shard_id: observation.shard_id.clone()?,
+        network_id: network_id.clone(),
+        shard_id: shard_id.clone(),
         block_number: observation.finalized_block?,
-        block_hash: observation.finalized_hash.clone()?,
+        block_hash: hash.to_ascii_lowercase(),
     })
 }
 
@@ -130,6 +160,8 @@ fn select_reference(groups: &HashMap<FinalizedIdentity, usize>) -> (FinalizedIde
                 .cmp(&right_id.block_number)
                 .then_with(|| left_count.cmp(right_count))
                 .then_with(|| left_id.block_hash.cmp(&right_id.block_hash))
+                .then_with(|| left_id.network_id.cmp(&right_id.network_id))
+                .then_with(|| left_id.shard_id.cmp(&right_id.shard_id))
         })
         .map(|(identity, count)| (identity.clone(), *count))
         .expect("non-empty finalized groups")
