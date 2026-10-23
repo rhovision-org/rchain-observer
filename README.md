@@ -1,4 +1,4 @@
-# rchain-observer
+# rholo-observer
 
 A read-only observation service that compares finalized snapshots across configured RChain HTTP endpoints and checks bounded raw-block justification ancestry when heights differ.
 
