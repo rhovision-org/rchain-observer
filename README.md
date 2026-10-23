@@ -2,7 +2,7 @@
 
 A read-only observation service that compares finalized snapshots across configured RChain HTTP endpoints and checks bounded raw-block justification ancestry when heights differ.
 
-Initiated and developed by [AixAria (`@aixaria0`)](https://github.com/aixaria0) for the [RChain Community](https://github.com/rchain-community).
+Initiated and developed by [AixAria (`@aixaria0`)](https://github.com/aixaria0) for the [RChain Community](https://github.com/rhovision-org).
 
 [Rholox](https://rholox.com) · [Hosted observation API](https://testnet.rhobot.net/observer/v1/observation) · [Hosted health](https://testnet.rhobot.net/observer/health) · [DApp guide](docs/BUILDING-DAPPS.md)
 
@@ -14,8 +14,8 @@ The hosted deployment can run a different revision from this repository. Inspect
 | --- | --- |
 | Service version | `0.2.0`, declared in `Cargo.toml` |
 | Report schema | `schema_version: 1` |
-| Integration | [PR #4](https://github.com/rchain-community/rchain-observer/pull/4), merge `a5d0796` |
-| Post-merge verification | [CI run 39885469376](https://github.com/rchain-community/rchain-observer/actions/runs/39885469376), all four jobs successful |
+| Integration | [PR #4](https://github.com/rhovision-org/rchain-observer/pull/4), merge `a5d0796` |
+| Post-merge verification | [CI run 39885469376](https://github.com/rhovision-org/rchain-observer/actions/runs/39885469376), all four jobs successful |
 | Hosted consumer | [Rholox 0.8.1](https://rholox.com/), a separate browser application and deployment |
 | Production check | 23 October 2026: health/readiness returned 200, version 0.2.0, fresh complete 4/4 coverage and single public CORS/cache headers |
 
